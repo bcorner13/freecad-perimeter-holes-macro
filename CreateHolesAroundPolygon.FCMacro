@@ -1,0 +1,170 @@
+import FreeCAD, Part
+from PySide import QtGui
+import math
+
+OUTPUT_NAME = "PerimeterHoles"
+
+def create_holes_around_sketch(sketch, hole_diameter, offset, min_number_of_holes, target_spacing):
+    doc = FreeCAD.ActiveDocument
+
+    # --- Idempotency: remove previous result ---
+    old = doc.getObject(OUTPUT_NAME)
+    if old:
+        doc.removeObject(OUTPUT_NAME)
+        doc.recompute()
+
+    holes = []
+
+    # --- Compute polygon centroid (XY plane) ---
+    verts = [v.Point for v in sketch.Shape.Vertexes]
+    cx = sum(v.x for v in verts) / len(verts)
+    cy = sum(v.y for v in verts) / len(verts)
+    centroid = FreeCAD.Vector(cx, cy, 0)
+
+    # --- Iterate edges ---
+    for edge in sketch.Shape.Edges:
+
+        start = edge.Vertexes[0].Point
+        end   = edge.Vertexes[1].Point
+
+        dx = end.x - start.x
+        dy = end.y - start.y
+        L  = math.hypot(dx, dy)
+        if L <= 0:
+            continue
+
+        # Unit direction along edge
+        ux = dx / L
+        uy = dy / L
+
+        # Candidate normals
+        n1 = FreeCAD.Vector(-uy, ux, 0)
+        n2 = FreeCAD.Vector( uy, -ux, 0)
+
+        # Edge midpoint
+        mid = FreeCAD.Vector(
+            (start.x + end.x) * 0.5,
+            (start.y + end.y) * 0.5,
+            0
+        )
+
+        # Pick inward normal (closest to centroid)
+        if (centroid - (mid + n1)).Length < (centroid - (mid + n2)).Length:
+            normal = n1
+        else:
+            normal = n2
+
+        # --- Corner-safe usable length ---
+        effective_length = L - 2 * offset
+        if effective_length <= 0:
+            continue
+
+        # --- Hole count (spacing is a target, not a pitch) ---
+        num_holes = int(round(effective_length / target_spacing))
+        if num_holes < min_number_of_holes:
+            num_holes = min_number_of_holes
+        if num_holes < 1:
+            num_holes = 1
+
+        # --- Even spacing ---
+        step = effective_length / (num_holes + 1)
+
+        # --- Place holes ---
+        for i in range(num_holes):
+            d = offset + (i + 1) * step
+
+            hole_pos = (
+                start
+                + FreeCAD.Vector(ux * d, uy * d, 0)
+                + normal * offset
+            )
+
+            hole = Part.makeCylinder(
+                hole_diameter * 0.5,
+                5.0,  # placeholder depth
+                hole_pos
+            )
+
+            holes.append(hole)
+
+    if not holes:
+        QtGui.QMessageBox.warning(None, "Warning", "No holes were created.")
+        return
+
+    compound = Part.Compound(holes)
+
+    # --- Create named result object ---
+    obj = doc.addObject("Part::Feature", OUTPUT_NAME)
+    obj.Shape = compound
+    doc.recompute()
+
+
+def main():
+    sketch_name, ok = QtGui.QInputDialog.getText(
+        None,
+        "Sketch",
+        "Enter sketch internal name:",
+        QtGui.QLineEdit.Normal,
+        "Sketch"
+    )
+    if not ok:
+        return
+
+    offset, ok = QtGui.QInputDialog.getDouble(
+        None,
+        "Offset",
+        "Offset from edge (mm):",
+        10.0,
+        0.0
+    )
+    if not ok:
+        return
+
+    hole_dia, ok = QtGui.QInputDialog.getDouble(
+        None,
+        "Hole Diameter",
+        "Hole diameter (mm):",
+        5.0,
+        0.0
+    )
+    if not ok:
+        return
+
+    min_holes, ok = QtGui.QInputDialog.getInt(
+        None,
+        "Min Holes",
+        "Minimum holes per edge:",
+        1,
+        1
+    )
+    if not ok:
+        return
+
+    spacing, ok = QtGui.QInputDialog.getDouble(
+        None,
+        "Spacing",
+        "Target spacing (mm):",
+        30.0,
+        0.0
+    )
+    if not ok:
+        return
+
+    sketch = FreeCAD.ActiveDocument.getObject(sketch_name)
+    if not sketch:
+        QtGui.QMessageBox.critical(
+            None,
+            "Error",
+            "Sketch not found."
+        )
+        return
+
+    create_holes_around_sketch(
+        sketch,
+        hole_dia,
+        offset,
+        min_holes,
+        spacing
+    )
+
+main()
