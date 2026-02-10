@@ -1,371 +1,176 @@
-# Version: 2.0
-import FreeCAD, Part, PartDesign
+# Version: 1.0.1
+# CreateHolesAroundPolygon_v2_4.FCMacro
+# FreeCAD 1.1+
+# Robust perimeter hole generator using centroid-based inward offset
+
+import FreeCAD as App
+import Part
 from PySide import QtGui
 import math
 
-OUTPUT_NAME = "PerimeterHoles"
+DOC = App.ActiveDocument
+if not DOC:
+    raise RuntimeError("No active document")
 
-def validate_sketch_geometry(sketch):
-    """
-    Validate that sketch has closed polygon geometry (not point-only).
-    Returns: (is_valid, error_message)
-    """
-    if not sketch:
-        return False, "Sketch is None"
-    
-    if not hasattr(sketch, 'Shape'):
-        return False, "Sketch has no Shape attribute"
-    
-    # Check for vertexes
-    verts = sketch.Shape.Vertexes
-    if not verts or len(verts) < 3:
-        return False, f"Sketch must have at least 3 vertices for a closed polygon. Found: {len(verts) if verts else 0}"
-    
-    # Check for edges (polygon geometry, not point-only)
-    edges = sketch.Shape.Edges
-    if not edges or len(edges) < 3:
-        return False, f"Sketch must have edges forming a closed polygon. Found: {len(edges) if edges else 0} edges. (Point-only sketches are not supported)"
-    
-    return True, ""
+EPS = 0.5  # mm breakthrough margin
 
-def get_pad_from_body(body):
-    """
-    Extract the first Pad from a PartDesign Body.
-    Returns: (pad, error_message) - pad is None if not found
-    """
-    if not body:
-        return None, "Body is None"
-    
-    if not hasattr(body, 'Tip'):
-        return None, "Object is not a PartDesign Body"
-    
-    # Traverse the body to find the Pad
-    for obj in body.OutList:
-        if obj.TypeId == 'PartDesign::Pad':
-            return obj, ""
-    
-    return None, "No Pad found in Body. Create a Pad from a closed polygon sketch first."
+# -------------------------------------------------
+# helpers
+# -------------------------------------------------
 
-def get_profile_sketch_from_pad(pad):
-    """
-    Extract the profile sketch from a Pad feature.
-    Returns: (sketch, error_message) - sketch is None if not found
-    """
-    if not pad:
-        return None, "Pad is None"
-    
-    if not hasattr(pad, 'Profile'):
-        return None, "Pad has no Profile attribute"
-    
-    profile = pad.Profile
-    if isinstance(profile, list) and len(profile) > 0:
-        sketch = profile[0]
+def select_from_list(title, label, objects):
+    if len(objects) == 1:
+        return objects[0]
+
+    names = [o.Name for o in objects]
+    choice, ok = QtGui.QInputDialog.getItem(
+        None, title, label, names, 0, False
+    )
+    if not ok:
+        raise RuntimeError("Cancelled")
+
+    for o in objects:
+        if o.Name == choice:
+            return o
+
+    raise RuntimeError("Invalid selection")
+
+def get_bodies():
+    return [o for o in DOC.Objects if o.TypeId == "PartDesign::Body"]
+
+def get_pads(body):
+    return [o for o in body.Group if o.TypeId == "PartDesign::Pad"]
+
+# -------------------------------------------------
+# user input
+# -------------------------------------------------
+
+hole_dia, ok = QtGui.QInputDialog.getDouble(
+    None, "Hole Diameter", "mm", 5.0, 0.0
+)
+if not ok:
+    raise RuntimeError
+
+edge_offset, ok = QtGui.QInputDialog.getDouble(
+    None, "Edge Offset", "mm", 10.0, 0.0
+)
+if not ok:
+    raise RuntimeError
+
+spacing, ok = QtGui.QInputDialog.getDouble(
+    None, "Target Spacing", "mm", 10.0, 0.0
+)
+if not ok:
+    raise RuntimeError
+
+min_holes, ok = QtGui.QInputDialog.getInt(
+    None, "Minimum holes per edge", "", 1, 1
+)
+if not ok:
+    raise RuntimeError
+
+# -------------------------------------------------
+# select body / pad
+# -------------------------------------------------
+
+body = select_from_list("Select Body", "Body:", get_bodies())
+pad  = select_from_list("Select Pad",  "Pad:",  get_pads(body))
+
+# -------------------------------------------------
+# select pad end face
+# -------------------------------------------------
+
+faces = pad.Shape.Faces
+face_index = len(faces)
+face = faces[face_index - 1]
+face_name = f"Face{face_index}"
+
+# Face centroid (critical for inward direction)
+face_centroid = face.CenterOfMass
+
+face_normal = face.normalAt(0.5, 0.5).normalize()
+edges = face.OuterWire.Edges
+
+# -------------------------------------------------
+# cleanup (idempotent)
+# -------------------------------------------------
+
+for obj in list(body.Group):
+    if obj.Name.startswith("PerimeterHole"):
+        body.removeObject(obj)
+
+DOC.recompute()
+
+# -------------------------------------------------
+# create sketch for points
+# -------------------------------------------------
+
+sketch = body.newObject(
+    "Sketcher::SketchObject",
+    "PerimeterHolePoints"
+)
+sketch.AttachmentSupport = [(pad, face_name)]
+sketch.MapMode = "FlatFace"
+
+DOC.recompute()
+
+# -------------------------------------------------
+# generate points
+# -------------------------------------------------
+
+for edge in edges:
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+
+    edge_vec = p1 - p0
+    L = edge_vec.Length
+    if L <= 0:
+        continue
+
+    usable = L - edge_offset * 2
+    if usable <= 0:
+        continue
+   
+    count = max(min_holes, int(usable / (spacing + hole_dia)))
+    step = usable / (count + 1)
+
+    edge_dir = edge_vec.normalize()
+
+    # Two candidate perpendiculars
+    perp1 = face_normal.cross(edge_dir).normalize()
+    perp2 = perp1.negative()
+
+    # Choose inward perpendicular using centroid
+    mid = (p0 + p1) * 0.5
+    test1 = mid + perp1
+    test2 = mid + perp2
+
+    if (face_centroid - test1).Length < (face_centroid - test2).Length:
+        perp = perp1
     else:
-        sketch = profile
-    
-    if not sketch:
-        return None, "Pad Profile is empty"
-    
-    return sketch, ""
+        perp = perp2
+	
+	# Calculate the offset baased on half the diameter
+    offset = (hole_dia / 2) + edge_offset
 
-def create_holes_around_sketch(sketch, hole_diameter, offset, min_number_of_holes, target_spacing):
-    """
-    Create hole pockets around the perimeter of a polygon sketch.
-    
-    Args:
-        sketch: Polygon sketch with closed geometry
-        hole_diameter: Diameter of holes in mm
-        offset: Distance from edge corners in mm
-        min_number_of_holes: Minimum holes per edge
-        target_spacing: Target spacing between holes in mm
-    
-    Returns:
-        holes list if successful, None if validation fails
-    """
-    doc = FreeCAD.ActiveDocument
+    for i in range(count):
+		# Calculate distance along the edge from the start point
+        d = edge_offset + (i + 1) * step
 
-    # --- Validate sketch geometry ---
-    is_valid, error_msg = validate_sketch_geometry(sketch)
-    if not is_valid:
-        QtGui.QMessageBox.critical(None, "Sketch Validation Error", error_msg)
-        return None
+		# Determine the position on the edge and apply the perpendicular offset
+        pt = p0 + edge_dir * d + perp * offset
+        sketch.addGeometry(Part.Point(pt))
 
-    # --- Idempotency: remove previous result ---
-    old = doc.getObject(OUTPUT_NAME)
-    if old:
-        doc.removeObject(OUTPUT_NAME)
-        doc.recompute()
+DOC.recompute()
 
-    holes = []
+# -------------------------------------------------
+# create PartDesign Hole
+# -------------------------------------------------
 
-    # --- Compute polygon centroid (XY plane) ---
-    verts = [v.Point for v in sketch.Shape.Vertexes]
-    cx = sum(v.x for v in verts) / len(verts)
-    cy = sum(v.y for v in verts) / len(verts)
-    centroid = FreeCAD.Vector(cx, cy, 0)
+hole = body.newObject("PartDesign::Hole", "PerimeterHoles")
+hole.Profile = sketch
+hole.Diameter = hole_dia
+hole.Depth = pad.Length.Value + EPS
 
-    # --- Iterate edges ---
-    for edge in sketch.Shape.Edges:
+DOC.recompute()
 
-        start = edge.Vertexes[0].Point
-        end   = edge.Vertexes[1].Point
-
-        dx = end.x - start.x
-        dy = end.y - start.y
-        L  = math.hypot(dx, dy)
-        if L <= 0:
-            continue
-
-        # Unit direction along edge
-        ux = dx / L
-        uy = dy / L
-
-        # Candidate normals
-        n1 = FreeCAD.Vector(-uy, ux, 0)
-        n2 = FreeCAD.Vector( uy, -ux, 0)
-
-        # Edge midpoint
-        mid = FreeCAD.Vector(
-            (start.x + end.x) * 0.5,
-            (start.y + end.y) * 0.5,
-            0
-        )
-
-        # Pick inward normal (closest to centroid)
-        if (centroid - (mid + n1)).Length < (centroid - (mid + n2)).Length:
-            normal = n1
-        else:
-            normal = n2
-
-        # --- Corner-safe usable length ---
-        effective_length = L - 2 * offset
-        if effective_length <= 0:
-            continue
-
-        # --- Hole count (spacing is a target, not a pitch) ---
-        num_holes = int(round(effective_length / target_spacing))
-        if num_holes < min_number_of_holes:
-            num_holes = min_number_of_holes
-        if num_holes < 1:
-            num_holes = 1
-
-        # --- Even spacing ---
-        step = effective_length / (num_holes + 1)
-
-        # --- Place holes ---
-        for i in range(num_holes):
-            d = offset + (i + 1) * step
-
-            hole_pos = (
-                start
-                + FreeCAD.Vector(ux * d, uy * d, 0)
-                + normal * offset
-            )
-
-            hole = Part.makeCylinder(
-                hole_diameter * 0.5,
-                5.0,  # placeholder depth
-                hole_pos
-            )
-
-            holes.append(hole)
-
-    if not holes:
-        QtGui.QMessageBox.warning(None, "Warning", "No holes were created. Check sketch geometry and parameters.")
-        return None
-
-    return holes
-
-def create_hole_features_in_body(body, pad, holes_geometry, hole_diameter):
-    """
-    Create Pocket (hole) features in a PartDesign Body.
-    
-    Args:
-        body: PartDesign Body object
-        pad: Pad feature (hole pockets will be created after this)
-        holes_geometry: List of Part.Cylinder geometries
-        hole_diameter: Diameter of holes for sketch sizing
-    
-    Returns:
-        True if successful, False otherwise
-    """
-    doc = FreeCAD.ActiveDocument
-    
-    # Create a sketch for each hole position in the Pad's sketch plane
-    hole_sketch = doc.addObject('Sketcher::SketchObject', 'PerimeterHoleSketch')
-    hole_sketch.MapReversed = False
-    
-    # Get the Pad's sketch plane
-    pad_sketch = pad.Profile[0] if isinstance(pad.Profile, list) else pad.Profile
-    hole_sketch.AttachmentMode = 'Deactivated'
-    
-    # Map to same plane as Pad profile
-    if hasattr(pad_sketch, 'Attachment'):
-        hole_sketch.AttachmentMode = pad_sketch.AttachmentMode
-        hole_sketch.AttachmentOffset = pad_sketch.AttachmentOffset
-        hole_sketch.MapReversed = pad_sketch.MapReversed
-        hole_sketch.MapPath = pad_sketch.MapPath
-    
-    hole_sketch.Support = pad_sketch.Support if hasattr(pad_sketch, 'Support') else None
-    
-    # Add hole circles to the sketch
-    radius = hole_diameter / 2.0
-    for i, hole_geom in enumerate(holes_geometry):
-        # Extract position from cylinder
-        placement = hole_geom.Placement
-        pos = placement.Base
-        
-        # Add circle at (pos.x, pos.y) with given radius
-        hole_sketch.addGeometry(
-            Part.Circle(
-                FreeCAD.Vector(pos.x, pos.y, 0),
-                FreeCAD.Vector(0, 0, 1),
-                radius
-            ),
-            False
-        )
-    
-    doc.recompute()
-    
-    # Create Pocket from the hole sketch
-    pocket = body.newObject('PartDesign::Pocket', OUTPUT_NAME)
-    pocket.Profile = (hole_sketch, [])
-    pocket.Length = 5.0  # Depth through hole (adjust as needed)
-    pocket.Reversed = False
-    pocket.Midplane = False
-    pocket.Offset = 0
-    
-    # Set pocket parameters
-    pocket.Type = 'Length'
-    pocket.Length = hole_diameter + 1.0  # Make sure it goes through
-    
-    if hasattr(pocket, 'MapReversed'):
-        pocket.MapReversed = False
-    
-    doc.recompute()
-    
-    return True
-
-
-
-def main():
-    """
-    Main function: Create holes around the perimeter of a PartDesign Body's Pad.
-    """
-    doc = FreeCAD.ActiveDocument
-    if not doc:
-        QtGui.QMessageBox.critical(None, "Error", "No active document. Please open a FreeCAD document.")
-        return
-    
-    # --- Get the Body ---
-    selection = FreeCAD.Gui.Selection.getSelection()
-    body = None
-    
-    if selection:
-        obj = selection[0]
-        if obj.TypeId == 'PartDesign::Body':
-            body = obj
-        else:
-            QtGui.QMessageBox.critical(
-                None,
-                "Error",
-                f"Selected object is not a PartDesign Body. Selected: {obj.Label} ({obj.TypeId})"
-            )
-            return
-    else:
-        QtGui.QMessageBox.critical(
-            None,
-            "Error",
-            "Please select a PartDesign Body containing a Pad."
-        )
-        return
-    
-    # --- Verify Pad exists ---
-    pad, pad_error = get_pad_from_body(body)
-    if not pad:
-        QtGui.QMessageBox.critical(None, "Pad Not Found", pad_error)
-        return
-    
-    # --- Get Profile Sketch from Pad ---
-    sketch, sketch_error = get_profile_sketch_from_pad(pad)
-    if not sketch:
-        QtGui.QMessageBox.critical(None, "Profile Sketch Not Found", sketch_error)
-        return
-    
-    # --- Get parameters from user ---
-    offset, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Offset",
-        "Offset from edge (mm):",
-        10.0,
-        0.0,
-        1000.0,
-        1
-    )
-    if not ok:
-        return
-
-    hole_dia, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Hole Diameter",
-        "Hole diameter (mm):",
-        5.0,
-        0.1,
-        100.0,
-        1
-    )
-    if not ok:
-        return
-
-    min_holes, ok = QtGui.QInputDialog.getInt(
-        None,
-        "Min Holes",
-        "Minimum holes per edge:",
-        1,
-        1,
-        100
-    )
-    if not ok:
-        return
-
-    spacing, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Spacing",
-        "Target spacing between holes (mm):",
-        30.0,
-        0.1,
-        1000.0,
-        1
-    )
-    if not ok:
-        return
-
-    # --- Create holes around sketch ---
-    holes = create_holes_around_sketch(
-        sketch,
-        hole_dia,
-        offset,
-        min_holes,
-        spacing
-    )
-    
-    if not holes:
-        return
-    
-    # --- Create hole features in the Body ---
-    try:
-        create_hole_features_in_body(body, pad, holes, hole_dia)
-        QtGui.QMessageBox.information(
-            None,
-            "Success",
-            f"Created {len(holes)} holes around the perimeter of the polygon."
-        )
-    except Exception as e:
-        QtGui.QMessageBox.critical(
-            None,
-            "Error Creating Holes",
-            f"Failed to create hole features: {str(e)}"
-        )
-        return
-
-main()
