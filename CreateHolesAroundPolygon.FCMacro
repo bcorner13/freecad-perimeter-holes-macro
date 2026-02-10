@@ -1,171 +1,176 @@
-# Version: 1.0
-import FreeCAD, Part
+# Version: 1.0.1
+# CreateHolesAroundPolygon_v2_4.FCMacro
+# FreeCAD 1.1+
+# Robust perimeter hole generator using centroid-based inward offset
+
+import FreeCAD as App
+import Part
 from PySide import QtGui
 import math
 
-OUTPUT_NAME = "PerimeterHoles"
+DOC = App.ActiveDocument
+if not DOC:
+    raise RuntimeError("No active document")
 
-def create_holes_around_sketch(sketch, hole_diameter, offset, min_number_of_holes, target_spacing):
-    doc = FreeCAD.ActiveDocument
+EPS = 0.5  # mm breakthrough margin
 
-    # --- Idempotency: remove previous result ---
-    old = doc.getObject(OUTPUT_NAME)
-    if old:
-        doc.removeObject(OUTPUT_NAME)
-        doc.recompute()
+# -------------------------------------------------
+# helpers
+# -------------------------------------------------
 
-    holes = []
+def select_from_list(title, label, objects):
+    if len(objects) == 1:
+        return objects[0]
 
-    # --- Compute polygon centroid (XY plane) ---
-    verts = [v.Point for v in sketch.Shape.Vertexes]
-    cx = sum(v.x for v in verts) / len(verts)
-    cy = sum(v.y for v in verts) / len(verts)
-    centroid = FreeCAD.Vector(cx, cy, 0)
-
-    # --- Iterate edges ---
-    for edge in sketch.Shape.Edges:
-
-        start = edge.Vertexes[0].Point
-        end   = edge.Vertexes[1].Point
-
-        dx = end.x - start.x
-        dy = end.y - start.y
-        L  = math.hypot(dx, dy)
-        if L <= 0:
-            continue
-
-        # Unit direction along edge
-        ux = dx / L
-        uy = dy / L
-
-        # Candidate normals
-        n1 = FreeCAD.Vector(-uy, ux, 0)
-        n2 = FreeCAD.Vector( uy, -ux, 0)
-
-        # Edge midpoint
-        mid = FreeCAD.Vector(
-            (start.x + end.x) * 0.5,
-            (start.y + end.y) * 0.5,
-            0
-        )
-
-        # Pick inward normal (closest to centroid)
-        if (centroid - (mid + n1)).Length < (centroid - (mid + n2)).Length:
-            normal = n1
-        else:
-            normal = n2
-
-        # --- Corner-safe usable length ---
-        effective_length = L - 2 * offset
-        if effective_length <= 0:
-            continue
-
-        # --- Hole count (spacing is a target, not a pitch) ---
-        num_holes = int(round(effective_length / target_spacing))
-        if num_holes < min_number_of_holes:
-            num_holes = min_number_of_holes
-        if num_holes < 1:
-            num_holes = 1
-
-        # --- Even spacing ---
-        step = effective_length / (num_holes + 1)
-
-        # --- Place holes ---
-        for i in range(num_holes):
-            d = offset + (i + 1) * step
-
-            hole_pos = (
-                start
-                + FreeCAD.Vector(ux * d, uy * d, 0)
-                + normal * offset
-            )
-
-            hole = Part.makeCylinder(
-                hole_diameter * 0.5,
-                5.0,  # placeholder depth
-                hole_pos
-            )
-
-            holes.append(hole)
-
-    if not holes:
-        QtGui.QMessageBox.warning(None, "Warning", "No holes were created.")
-        return
-
-    compound = Part.Compound(holes)
-
-    # --- Create named result object ---
-    obj = doc.addObject("Part::Feature", OUTPUT_NAME)
-    obj.Shape = compound
-    doc.recompute()
-
-
-def main():
-    sketch_name, ok = QtGui.QInputDialog.getText(
-        None,
-        "Sketch",
-        "Enter sketch internal name:",
-        QtGui.QLineEdit.Normal,
-        "Sketch"
+    names = [o.Name for o in objects]
+    choice, ok = QtGui.QInputDialog.getItem(
+        None, title, label, names, 0, False
     )
     if not ok:
-        return
+        raise RuntimeError("Cancelled")
 
-    offset, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Offset",
-        "Offset from edge (mm):",
-        10.0,
-        0.0
-    )
-    if not ok:
-        return
+    for o in objects:
+        if o.Name == choice:
+            return o
 
-    hole_dia, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Hole Diameter",
-        "Hole diameter (mm):",
-        5.0,
-        0.0
-    )
-    if not ok:
-        return
+    raise RuntimeError("Invalid selection")
 
-    min_holes, ok = QtGui.QInputDialog.getInt(
-        None,
-        "Min Holes",
-        "Minimum holes per edge:",
-        1,
-        1
-    )
-    if not ok:
-        return
+def get_bodies():
+    return [o for o in DOC.Objects if o.TypeId == "PartDesign::Body"]
 
-    spacing, ok = QtGui.QInputDialog.getDouble(
-        None,
-        "Spacing",
-        "Target spacing (mm):",
-        30.0,
-        0.0
-    )
-    if not ok:
-        return
+def get_pads(body):
+    return [o for o in body.Group if o.TypeId == "PartDesign::Pad"]
 
-    sketch = FreeCAD.ActiveDocument.getObject(sketch_name)
-    if not sketch:
-        QtGui.QMessageBox.critical(
-            None,
-            "Error",
-            "Sketch not found."
-        )
-        return
+# -------------------------------------------------
+# user input
+# -------------------------------------------------
 
-    create_holes_around_sketch(
-        sketch,
-        hole_dia,
-        offset,
-        min_holes,
-        spacing
-    )
+hole_dia, ok = QtGui.QInputDialog.getDouble(
+    None, "Hole Diameter", "mm", 5.0, 0.0
+)
+if not ok:
+    raise RuntimeError
 
-main()
+edge_offset, ok = QtGui.QInputDialog.getDouble(
+    None, "Edge Offset", "mm", 10.0, 0.0
+)
+if not ok:
+    raise RuntimeError
+
+spacing, ok = QtGui.QInputDialog.getDouble(
+    None, "Target Spacing", "mm", 10.0, 0.0
+)
+if not ok:
+    raise RuntimeError
+
+min_holes, ok = QtGui.QInputDialog.getInt(
+    None, "Minimum holes per edge", "", 1, 1
+)
+if not ok:
+    raise RuntimeError
+
+# -------------------------------------------------
+# select body / pad
+# -------------------------------------------------
+
+body = select_from_list("Select Body", "Body:", get_bodies())
+pad  = select_from_list("Select Pad",  "Pad:",  get_pads(body))
+
+# -------------------------------------------------
+# select pad end face
+# -------------------------------------------------
+
+faces = pad.Shape.Faces
+face_index = len(faces)
+face = faces[face_index - 1]
+face_name = f"Face{face_index}"
+
+# Face centroid (critical for inward direction)
+face_centroid = face.CenterOfMass
+
+face_normal = face.normalAt(0.5, 0.5).normalize()
+edges = face.OuterWire.Edges
+
+# -------------------------------------------------
+# cleanup (idempotent)
+# -------------------------------------------------
+
+for obj in list(body.Group):
+    if obj.Name.startswith("PerimeterHole"):
+        body.removeObject(obj)
+
+DOC.recompute()
+
+# -------------------------------------------------
+# create sketch for points
+# -------------------------------------------------
+
+sketch = body.newObject(
+    "Sketcher::SketchObject",
+    "PerimeterHolePoints"
+)
+sketch.AttachmentSupport = [(pad, face_name)]
+sketch.MapMode = "FlatFace"
+
+DOC.recompute()
+
+# -------------------------------------------------
+# generate points
+# -------------------------------------------------
+
+for edge in edges:
+    p0 = edge.Vertexes[0].Point
+    p1 = edge.Vertexes[1].Point
+
+    edge_vec = p1 - p0
+    L = edge_vec.Length
+    if L <= 0:
+        continue
+
+    usable = L - edge_offset * 2
+    if usable <= 0:
+        continue
+   
+    count = max(min_holes, int(usable / (spacing + hole_dia)))
+    step = usable / (count + 1)
+
+    edge_dir = edge_vec.normalize()
+
+    # Two candidate perpendiculars
+    perp1 = face_normal.cross(edge_dir).normalize()
+    perp2 = perp1.negative()
+
+    # Choose inward perpendicular using centroid
+    mid = (p0 + p1) * 0.5
+    test1 = mid + perp1
+    test2 = mid + perp2
+
+    if (face_centroid - test1).Length < (face_centroid - test2).Length:
+        perp = perp1
+    else:
+        perp = perp2
+	
+	# Calculate the offset baased on half the diameter
+    offset = (hole_dia / 2) + edge_offset
+
+    for i in range(count):
+		# Calculate distance along the edge from the start point
+        d = edge_offset + (i + 1) * step
+
+		# Determine the position on the edge and apply the perpendicular offset
+        pt = p0 + edge_dir * d + perp * offset
+        sketch.addGeometry(Part.Point(pt))
+
+DOC.recompute()
+
+# -------------------------------------------------
+# create PartDesign Hole
+# -------------------------------------------------
+
+hole = body.newObject("PartDesign::Hole", "PerimeterHoles")
+hole.Profile = sketch
+hole.Diameter = hole_dia
+hole.Depth = pad.Length.Value + EPS
+
+DOC.recompute()
+
